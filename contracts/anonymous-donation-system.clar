@@ -11,11 +11,16 @@
 (define-constant err-already-revealed (err u108))
 (define-constant err-invalid-reveal (err u109))
 (define-constant err-reveal-period-ended (err u110))
+(define-constant err-matching-pool-not-found (err u111))
+(define-constant err-matching-pool-inactive (err u112))
+(define-constant err-invalid-multiplier (err u113))
+(define-constant err-insufficient-pool-balance (err u114))
 
 (define-data-var next-recipient-id uint u1)
 (define-data-var next-commitment-id uint u1)
 (define-data-var total-donations uint u0)
 (define-data-var contract-fee-rate uint u250)
+(define-data-var next-matching-pool-id uint u1)
 
 (define-map recipients
   { recipient-id: uint }
@@ -52,6 +57,19 @@
 (define-map recipient-withdrawals
   { recipient-id: uint }
   { total-withdrawn: uint }
+)
+
+(define-map matching-pools
+  { pool-id: uint }
+  {
+    creator: principal,
+    recipient-id: uint,
+    multiplier: uint,
+    active: bool,
+    pool-balance: uint,
+    start-block: uint,
+    end-block: uint
+  }
 )
 
 (define-read-only (get-recipient (recipient-id uint))
@@ -98,6 +116,43 @@
         (total-withdrawn (get-recipient-total-withdrawn recipient-id))
       )
       (- total-received total-withdrawn)
+    )
+    u0
+  )
+)
+
+(define-read-only (get-matching-pool (pool-id uint))
+  (map-get? matching-pools { pool-id: pool-id })
+)
+
+(define-read-only (is-matching-pool-active (pool-id uint))
+  (match (get-matching-pool pool-id)
+    pool
+    (and
+      (get active pool)
+      (< stacks-block-height (get end-block pool))
+      (>= stacks-block-height (get start-block pool))
+    )
+    false
+  )
+)
+
+(define-read-only (calculate-matched-amount (pool-id uint) (base-amount uint))
+  (match (get-matching-pool pool-id)
+    pool
+    (if (is-matching-pool-active pool-id)
+      (let
+        (
+          (pool-balance (get pool-balance pool))
+          (multiplier (get multiplier pool))
+          (match-amount (* base-amount (- multiplier u1)))
+        )
+        (if (>= pool-balance match-amount)
+          match-amount
+          u0
+        )
+      )
+      u0
     )
     u0
   )
@@ -175,42 +230,61 @@
   )
 )
 
-(define-public (reveal-and-donate (commitment-id uint) (nonce uint) (amount uint))
+(define-public (reveal-and-donate (commitment-id uint) (nonce uint) (amount uint) (pool-id (optional uint)))
   (let
     (
       (commitment-data (unwrap! (get-commitment commitment-id) err-commitment-not-found))
-      (expected-hash (sha256 (concat (concat (unwrap-panic (to-consensus-buff? nonce)) 
+      (expected-hash (sha256 (concat (concat (unwrap-panic (to-consensus-buff? nonce))
                                             (unwrap-panic (to-consensus-buff? amount)))
                                     (unwrap-panic (to-consensus-buff? tx-sender)))))
       (recipient-id (get recipient-id commitment-data))
       (fee-amount (calculate-fee amount))
       (net-amount (- amount fee-amount))
+      (match-amount (if (is-some pool-id)
+                      (calculate-matched-amount (unwrap-panic pool-id) net-amount)
+                      u0
+                    ))
+      (total-to-recipient (+ net-amount match-amount))
     )
     (asserts! (not (get revealed commitment-data)) err-already-revealed)
     (asserts! (is-eq expected-hash (get commitment-hash commitment-data)) err-invalid-reveal)
     (asserts! (< (- stacks-block-height (get stacks-block-height commitment-data)) u100) err-reveal-period-ended)
     (asserts! (> amount u0) err-invalid-amount)
-    
+
     (match (get-recipient recipient-id)
       recipient
       (begin
         (asserts! (get active recipient) err-recipient-not-found)
-        
+
         (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
-        
+
         (map-set donation-commitments
           { commitment-id: commitment-id }
           (merge commitment-data { revealed: true, amount: amount })
         )
-        
+
         (map-set recipients
           { recipient-id: recipient-id }
-          (merge recipient { total-received: (+ (get total-received recipient) net-amount) })
+          (merge recipient { total-received: (+ (get total-received recipient) total-to-recipient) })
         )
-        
+
+        (if (> match-amount u0)
+          (let
+            (
+              (pool-id-val (unwrap-panic pool-id))
+              (pool-data (unwrap-panic (get-matching-pool pool-id-val)))
+            )
+            (map-set matching-pools
+              { pool-id: pool-id-val }
+              (merge pool-data { pool-balance: (- (get pool-balance pool-data) match-amount) })
+            )
+          )
+          true
+        )
+
         (var-set total-donations (+ (var-get total-donations) amount))
-        
-        (ok net-amount)
+
+        (ok total-to-recipient)
       )
       err-recipient-not-found
     )
@@ -232,7 +306,7 @@
   )
 )
 
-(define-public (anonymous-donate (commitment-hash (buff 32)) (recipient-id uint) (amount uint) (reveal-nonce uint))
+(define-public (anonymous-donate (commitment-hash (buff 32)) (recipient-id uint) (amount uint) (reveal-nonce uint) (pool-id (optional uint)))
   (let
     (
       (current-balance (get-anonymous-balance commitment-hash))
@@ -240,29 +314,48 @@
                                     (unwrap-panic (to-consensus-buff? amount)))))
       (fee-amount (calculate-fee amount))
       (net-amount (- amount fee-amount))
+      (match-amount (if (is-some pool-id)
+                      (calculate-matched-amount (unwrap-panic pool-id) net-amount)
+                      u0
+                    ))
+      (total-to-recipient (+ net-amount match-amount))
     )
     (asserts! (>= current-balance amount) err-insufficient-balance)
     (asserts! (> amount u0) err-invalid-amount)
     (asserts! (is-eq commitment-hash expected-hash) err-invalid-reveal)
-    
+
     (match (get-recipient recipient-id)
       recipient
       (begin
         (asserts! (get active recipient) err-recipient-not-found)
-        
+
         (map-set anonymous-balances
           { commitment-hash: commitment-hash }
           { balance: (- current-balance amount) }
         )
-        
+
         (map-set recipients
           { recipient-id: recipient-id }
-          (merge recipient { total-received: (+ (get total-received recipient) net-amount) })
+          (merge recipient { total-received: (+ (get total-received recipient) total-to-recipient) })
         )
-        
+
+        (if (> match-amount u0)
+          (let
+            (
+              (pool-id-val (unwrap-panic pool-id))
+              (pool-data (unwrap-panic (get-matching-pool pool-id-val)))
+            )
+            (map-set matching-pools
+              { pool-id: pool-id-val }
+              (merge pool-data { pool-balance: (- (get pool-balance pool-data) match-amount) })
+            )
+          )
+          true
+        )
+
         (var-set total-donations (+ (var-get total-donations) amount))
-        
-        (ok net-amount)
+
+        (ok total-to-recipient)
       )
       err-recipient-not-found
     )
@@ -313,6 +406,79 @@
     (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
     
     (ok amount)
+  )
+)
+
+(define-public (create-matching-pool (recipient-id uint) (multiplier uint) (pool-amount uint) (duration-blocks uint))
+  (let
+    (
+      (pool-id (var-get next-matching-pool-id))
+      (start-block stacks-block-height)
+      (end-block (+ stacks-block-height duration-blocks))
+    )
+    (asserts! (is-some (get-recipient recipient-id)) err-recipient-not-found)
+    (asserts! (and (>= multiplier u2) (<= multiplier u10)) err-invalid-multiplier)
+    (asserts! (> pool-amount u0) err-invalid-amount)
+
+    (try! (stx-transfer? pool-amount tx-sender (as-contract tx-sender)))
+
+    (map-set matching-pools
+      { pool-id: pool-id }
+      {
+        creator: tx-sender,
+        recipient-id: recipient-id,
+        multiplier: multiplier,
+        active: true,
+        pool-balance: pool-amount,
+        start-block: start-block,
+        end-block: end-block
+      }
+    )
+
+    (var-set next-matching-pool-id (+ pool-id u1))
+
+    (ok pool-id)
+  )
+)
+
+(define-public (deactivate-matching-pool (pool-id uint))
+  (match (get-matching-pool pool-id)
+    pool
+    (begin
+      (asserts! (is-eq tx-sender (get creator pool)) err-owner-only)
+
+      (map-set matching-pools
+        { pool-id: pool-id }
+        (merge pool { active: false })
+      )
+
+      (ok true)
+    )
+    err-matching-pool-not-found
+  )
+)
+
+(define-public (refund-matching-pool (pool-id uint))
+  (match (get-matching-pool pool-id)
+    pool
+    (let
+      (
+        (remaining-balance (get pool-balance pool))
+      )
+      (asserts! (is-eq tx-sender (get creator pool)) err-owner-only)
+      (asserts! (not (get active pool)) err-matching-pool-inactive)
+      (asserts! (> remaining-balance u0) err-insufficient-pool-balance)
+
+      (try! (as-contract (stx-transfer? remaining-balance tx-sender (get creator pool))))
+
+      (map-set matching-pools
+        { pool-id: pool-id }
+        (merge pool { pool-balance: u0 })
+      )
+
+      (ok remaining-balance)
+    )
+    err-matching-pool-not-found
   )
 )
 
