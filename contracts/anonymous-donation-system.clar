@@ -15,6 +15,7 @@
 (define-constant err-matching-pool-inactive (err u112))
 (define-constant err-invalid-multiplier (err u113))
 (define-constant err-insufficient-pool-balance (err u114))
+(define-constant err-duplicate-commitment-hash (err u115))
 
 (define-data-var next-recipient-id uint u1)
 (define-data-var next-commitment-id uint u1)
@@ -47,6 +48,11 @@
     recipient-id: uint,
     amount: uint
   }
+)
+
+(define-map commitment-index
+  { commitment-hash: (buff 32) }
+  { commitment-id: uint }
 )
 
 (define-map anonymous-balances
@@ -93,6 +99,13 @@
 
 (define-read-only (get-commitment (commitment-id uint))
   (map-get? donation-commitments { commitment-id: commitment-id })
+)
+
+(define-read-only (get-commitment-by-hash (commitment-hash (buff 32)))
+  (match (map-get? commitment-index { commitment-hash: commitment-hash })
+    entry (get-commitment (get commitment-id entry))
+    none
+  )
 )
 
 (define-read-only (get-anonymous-balance (commitment-hash (buff 32)))
@@ -212,7 +225,7 @@
     )
     (asserts! (is-some (get-recipient recipient-id)) err-recipient-not-found)
     (asserts! (is-none (map-get? donation-commitments { commitment-id: commitment-id })) err-invalid-commitment)
-    
+    (asserts! (is-none (map-get? commitment-index { commitment-hash: commitment-hash })) err-duplicate-commitment-hash)
     (map-set donation-commitments
       { commitment-id: commitment-id }
       {
@@ -223,9 +236,11 @@
         amount: u0
       }
     )
-    
+    (map-set commitment-index
+      { commitment-hash: commitment-hash }
+      { commitment-id: commitment-id }
+    )
     (var-set next-commitment-id (+ commitment-id u1))
-    
     (ok commitment-id)
   )
 )
