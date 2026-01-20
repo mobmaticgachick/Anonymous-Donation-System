@@ -17,11 +17,24 @@
 (define-constant err-insufficient-pool-balance (err u114))
 (define-constant err-duplicate-commitment-hash (err u115))
 
+;; Campaign Errors
+(define-constant err-campaign-not-found (err u200))
+(define-constant err-campaign-ended (err u201))
+(define-constant err-campaign-active (err u202))
+(define-constant err-target-not-reached (err u203))
+(define-constant err-target-reached (err u204))
+(define-constant err-already-claimed (err u205))
+(define-constant err-pledge-not-found (err u206))
+
 (define-data-var next-recipient-id uint u1)
 (define-data-var next-commitment-id uint u1)
 (define-data-var total-donations uint u0)
 (define-data-var contract-fee-rate uint u250)
 (define-data-var next-matching-pool-id uint u1)
+
+;; Campaign Vars
+(define-data-var next-campaign-id uint u1)
+(define-data-var total-campaign-funds uint u0)
 
 (define-map recipients
   { recipient-id: uint }
@@ -76,6 +89,24 @@
     start-block: uint,
     end-block: uint
   }
+)
+
+;; Campaign Maps
+(define-map campaigns
+  { campaign-id: uint }
+  {
+    recipient-id: uint,
+    target-amount: uint,
+    raised-amount: uint,
+    deadline: uint,
+    claimed: bool,
+    active: bool
+  }
+)
+
+(define-map campaign-pledges
+  { campaign-id: uint, donor: principal }
+  { amount: uint }
 )
 
 (define-read-only (get-recipient (recipient-id uint))
@@ -169,6 +200,15 @@
     )
     u0
   )
+)
+
+;; Campaign Read-Only
+(define-read-only (get-campaign (campaign-id uint))
+  (map-get? campaigns { campaign-id: campaign-id })
+)
+
+(define-read-only (get-pledge (campaign-id uint) (donor principal))
+  (default-to { amount: u0 } (map-get? campaign-pledges { campaign-id: campaign-id, donor: donor }))
 )
 
 (define-public (register-recipient (name (string-ascii 64)) (description (string-ascii 256)))
@@ -508,12 +548,116 @@
   )
 )
 
+;; Campaign Functions
+
+(define-public (create-campaign (recipient-id uint) (target-amount uint) (duration uint))
+  (let
+    (
+      (campaign-id (var-get next-campaign-id))
+      (recipient (unwrap! (get-recipient recipient-id) err-recipient-not-found))
+    )
+    (asserts! (is-eq tx-sender (get owner recipient)) err-owner-only)
+    (asserts! (> target-amount u0) err-invalid-amount)
+    (asserts! (> duration u0) err-invalid-amount)
+
+    (map-set campaigns
+      { campaign-id: campaign-id }
+      {
+        recipient-id: recipient-id,
+        target-amount: target-amount,
+        raised-amount: u0,
+        deadline: (+ stacks-block-height duration),
+        claimed: false,
+        active: true
+      }
+    )
+
+    (var-set next-campaign-id (+ campaign-id u1))
+    (ok campaign-id)
+  )
+)
+
+(define-public (pledge-to-campaign (campaign-id uint) (amount uint))
+  (let
+    (
+      (campaign (unwrap! (get-campaign campaign-id) err-campaign-not-found))
+      (current-pledge (get-pledge campaign-id tx-sender))
+    )
+    (asserts! (get active campaign) err-campaign-ended)
+    (asserts! (< stacks-block-height (get deadline campaign)) err-campaign-ended)
+    (asserts! (> amount u0) err-invalid-amount)
+
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+
+    (map-set campaign-pledges
+      { campaign-id: campaign-id, donor: tx-sender }
+      { amount: (+ (get amount current-pledge) amount) }
+    )
+
+    (map-set campaigns
+      { campaign-id: campaign-id }
+      (merge campaign { raised-amount: (+ (get raised-amount campaign) amount) })
+    )
+
+    (var-set total-campaign-funds (+ (var-get total-campaign-funds) amount))
+
+    (ok true)
+  )
+)
+
+(define-public (claim-campaign-funds (campaign-id uint))
+  (let
+    (
+      (campaign (unwrap! (get-campaign campaign-id) err-campaign-not-found))
+      (recipient (unwrap! (get-recipient (get recipient-id campaign)) err-recipient-not-found))
+    )
+    (asserts! (is-eq tx-sender (get owner recipient)) err-owner-only)
+    (asserts! (>= (get raised-amount campaign) (get target-amount campaign)) err-target-not-reached)
+    (asserts! (not (get claimed campaign)) err-already-claimed)
+
+    (try! (as-contract (stx-transfer? (get raised-amount campaign) tx-sender (get owner recipient))))
+
+    (map-set campaigns
+      { campaign-id: campaign-id }
+      (merge campaign { claimed: true, active: false })
+    )
+
+    (var-set total-campaign-funds (- (var-get total-campaign-funds) (get raised-amount campaign)))
+
+    (ok (get raised-amount campaign))
+  )
+)
+
+(define-public (refund-pledge (campaign-id uint))
+  (let
+    (
+      (campaign (unwrap! (get-campaign campaign-id) err-campaign-not-found))
+      (pledge (get-pledge campaign-id tx-sender))
+    )
+    (asserts! (>= stacks-block-height (get deadline campaign)) err-campaign-active)
+    (asserts! (< (get raised-amount campaign) (get target-amount campaign)) err-target-reached)
+    (asserts! (> (get amount pledge) u0) err-pledge-not-found)
+
+    (try! (as-contract (stx-transfer? (get amount pledge) tx-sender tx-sender)))
+
+    (map-set campaign-pledges
+      { campaign-id: campaign-id, donor: tx-sender }
+      { amount: u0 }
+    )
+
+    (var-set total-campaign-funds (- (var-get total-campaign-funds) (get amount pledge)))
+
+    (ok (get amount pledge))
+  )
+)
+
 (define-public (collect-fees)
   (let
     (
       (contract-balance (stx-get-balance (as-contract tx-sender)))
       (total-recipient-balances (fold calculate-total-recipient-balances (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) u0))
-      (available-fees (- contract-balance total-recipient-balances))
+      (campaign-funds (var-get total-campaign-funds))
+      (available-fees (- contract-balance (+ total-recipient-balances campaign-funds)))
     )
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
     (asserts! (> available-fees u0) err-insufficient-balance)
